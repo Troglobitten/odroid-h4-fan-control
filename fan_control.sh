@@ -159,6 +159,9 @@ if [ ! -e "$fanSpeedDir" ] || [ ! -e "$fanRpmDir" ] || [ ! -e "$cpuTempDir" ]; t
     exit 1
 fi
 
+# Initialise cooldown.
+cooldown=0
+
 # Infinite loop to monitor and control fan speed based on the highest temperature
 while true; do
     # Read the current fan speed, fan RPM, and CPU temperature
@@ -227,15 +230,30 @@ while true; do
     pwmNVMe=$(calculate_pwm "$maxNVMe" "$NVME_LOW_TEMP" "$NVME_HIGH_TEMP")
 
     # Determine the highest PWM value
-    if [ "$pwmCPU" -ge "$pwmDrive" ] && [ "$pwmCPU" -ge "$pwmNVMe" ]; then
+    if (( "$pwmCPU" + "$pwmDrive" + "$pwmNVMe" == 0 )); then
+        if (( "$cooldown" > 0 )); then
+            pwmValue=$MIN_PWM
+            log "Setting PWM to MIN because of cooldown ($cooldown interval(s) left)"
+            cooldown=$((cooldown - 1))
+        else
+            pwmValue=0
+            log "No MIN thresholds met and no cooldown, fan off."
+        fi
+    elif (( "$pwmCPU" > "$pwmDrive" )) && (( "$pwmCPU" > "$pwmNVMe" )); then
         pwmValue=$pwmCPU
         log "Setting PWM based on CPU temperature"
-    elif [ "$pwmDrive" -ge "$pwmCPU" ] && [ "$pwmDrive" -ge "$pwmNVMe" ]; then
+        cooldown=$COOLDOWN_MAX
+    elif (( "$pwmDrive" > "$pwmCPU" )) && (( "$pwmDrive" > "$pwmNVMe" )); then
         pwmValue=$pwmDrive
         log "Setting PWM based on Drive temperature"
-    else
+        cooldown=$COOLDOWN_MAX
+    elif (( "$pwmNVMe" > "$pwmDrive" )) && (( "$pwmNVMe" > "$pwmCPU" )); then
         pwmValue=$pwmNVMe
         log "Setting PWM based on NVMe temperature"
+        cooldown=$COOLDOWN_MAX
+    else
+        pwmValue=$MAX_PWM
+        log_error "Unknown state, turning fan on. Check your configuration."
     fi
 
     # Set the fan speed to the highest PWM value
