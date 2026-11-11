@@ -39,6 +39,12 @@ CurveMethod = Literal["lin", "log", "exp"]
 LOG_REPORT_INTERVAL = 30.0  # seconds between heartbeat status lines
 SUBPROCESS_TIMEOUT = 5  # seconds
 MISSING_CACHE_TTL = 60.0  # seconds before an "absent source" is re-probed
+# Readings outside this window are sensor glitches (e.g. a packed SMART raw
+# value or an uninitialised sensor at boot), never real temperatures. They are
+# discarded so a bogus value can neither drive the curve nor trigger an
+# overheat shutdown.
+TEMP_PLAUSIBLE_MIN = -40
+TEMP_PLAUSIBLE_MAX = 150
 
 
 @dataclass(frozen=True)
@@ -53,6 +59,7 @@ class FanConfig:
     overheat_threshold: int = 95
     pwm_hysteresis: int = 2
     verbose: bool = False
+    overheat_confirm: int = 3
 
     def validate(self) -> FanConfig:
         if self.tmin >= self.tmax:
@@ -71,6 +78,10 @@ class FanConfig:
         if self.overheat_threshold < 0:
             raise ValueError(
                 f"--overheat-threshold must be >= 0 (got {self.overheat_threshold})"
+            )
+        if self.overheat_confirm < 1:
+            raise ValueError(
+                f"--overheat-confirm must be >= 1 (got {self.overheat_confirm})"
             )
         return self
 
@@ -146,6 +157,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Temperature (°C) at which overheat shutdown triggers (default: 95)",
     )
     parser.add_argument(
+        "--overheat-confirm",
+        type=int,
+        default=3,
+        help="Consecutive over-threshold readings required before shutdown (default: 3)",
+    )
+    parser.add_argument(
         "--pwm-hysteresis",
         type=int,
         default=2,
@@ -168,6 +185,7 @@ def parse_cli(argv: Optional[Sequence[str]] = None) -> FanConfig:
         overheat_threshold=args.overheat_threshold,
         pwm_hysteresis=args.pwm_hysteresis,
         verbose=args.verbose,
+        overheat_confirm=args.overheat_confirm,
     )
     try:
         return config.validate()
@@ -203,6 +221,34 @@ def scale_temp(raw: int, *, millidegrees: bool) -> int:
     if millidegrees:
         return raw // 1000
     return raw
+
+
+_implausible_logged: Dict[str, float] = {}  # source -> monotonic time of last warning
+
+
+def plausible(value: TempReading, source: str) -> TempReading:
+    """Return ``value`` if it is a physically plausible °C reading, else None.
+
+    Implausible values are logged at WARNING at most once per
+    LOG_REPORT_INTERVAL per source, so a permanently broken sensor is visible
+    without flooding the journal.
+    """
+    if value is None:
+        return None
+    if TEMP_PLAUSIBLE_MIN <= value <= TEMP_PLAUSIBLE_MAX:
+        return value
+    now = time.monotonic()
+    last = _implausible_logged.get(source)
+    if last is None or now - last >= LOG_REPORT_INTERVAL:
+        logger.warning(
+            "Ignoring implausible temperature %s°C from %s (valid range %s..%s°C)",
+            value,
+            source,
+            TEMP_PLAUSIBLE_MIN,
+            TEMP_PLAUSIBLE_MAX,
+        )
+        _implausible_logged[source] = now
+    return None
 
 
 # Memoizes "path/source absent" probes so NVMe/sensors/smartctl aren't
@@ -257,7 +303,9 @@ def read_cpu_temp() -> TempReading:
                     v = _read_int(tfile)
                     if v is None:
                         continue
-                    labeled_values.append(scale_temp(v, millidegrees=True))
+                    t = plausible(scale_temp(v, millidegrees=True), tfile)
+                    if t is not None:
+                        labeled_values.append(t)
             if labeled_values:
                 candidate = max(labeled_values)
                 if best is None or candidate > best:
@@ -268,7 +316,9 @@ def read_cpu_temp() -> TempReading:
                 v = _read_int(tfile)
                 if v is None:
                     continue
-                candidate = scale_temp(v, millidegrees=True)
+                candidate = plausible(scale_temp(v, millidegrees=True), tfile)
+                if candidate is None:
+                    continue
                 if best is None or candidate > best:
                     best = candidate
 
@@ -282,7 +332,9 @@ def read_cpu_temp() -> TempReading:
         v = _read_int(p)
         if v is None:
             continue
-        candidate = scale_temp(v, millidegrees=True)
+        candidate = plausible(scale_temp(v, millidegrees=True), p)
+        if candidate is None:
+            continue
         if zone_best is None or candidate > zone_best:
             zone_best = candidate
     if zone_best is not None:
@@ -298,16 +350,74 @@ def read_cpu_temp() -> TempReading:
                 if "package id" in line.lower() or re.search(r"core\s+\d+", line.lower()):
                     m = re.search(r"(-?\d+(\.\d+)?)\s*°C", line)
                     if m:
-                        return scale_temp(round(float(m.group(1))), millidegrees=False)
+                        t = plausible(round(float(m.group(1))), "sensors")
+                        if t is not None:
+                            return t
             for line in out.splitlines():
                 m = re.search(r"(-?\d+(\.\d+)?)\s*°C", line)
                 if m:
-                    return scale_temp(round(float(m.group(1))), millidegrees=False)
+                    t = plausible(round(float(m.group(1))), "sensors")
+                    if t is not None:
+                        return t
         except (OSError, subprocess.SubprocessError):
             _mark_missing("sensors")
 
     logger.debug("read_cpu_temp: no CPU temperature source found")
     return None
+
+
+def _parse_nvme_temp(out: str) -> TempReading:
+    """Extract the composite temperature in °C from ``nvme smart-log`` output.
+
+    Only the line whose key is exactly ``temperature`` counts (not e.g.
+    ``Warning Temperature Time``). Handles both ``38 C (311 Kelvin)`` and
+    ``311 K (38 °C)`` styles by preferring an explicit Celsius value.
+    """
+    for line in out.splitlines():
+        key, sep, value = line.partition(":")
+        if not sep or key.strip().lower() != "temperature":
+            continue
+        m = re.search(r"(-?\d+)\s*°?\s*C\b", value)
+        if m:
+            return int(m.group(1))
+        m = re.search(r"(-?\d+)\s*K(?:elvin)?\b", value)
+        if m:
+            return int(m.group(1)) - 273
+        m = re.search(r"(-?\d+)", value)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _parse_smartctl_temp(out: str) -> TempReading:
+    """Extract a drive temperature in °C from ``smartctl -A`` output.
+
+    ATA attribute rows look like::
+
+        194 Temperature_Celsius 0x0022 036 045 000 Old_age Always - 36 (Min/Max 20/45)
+
+    The temperature is the *first* integer of the RAW_VALUE column (field 10),
+    not the last number on the line (that would be the Max, or a packed
+    48-bit raw value of billions of °C). Attribute 194 is preferred over 190.
+    SCSI/SAS output (``Current Drive Temperature: 36 C``) is also handled.
+    """
+    candidates: Dict[str, int] = {}
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) >= 10 and fields[0].isdigit() and "temp" in fields[1].lower():
+            m = re.match(r"(-?\d+)", fields[9])
+            if m:
+                candidates.setdefault(fields[0], int(m.group(1)))
+            continue
+        low = line.strip().lower()
+        if low.startswith(("current drive temperature", "temperature:")):
+            m = re.search(r"(-?\d+)", line.split(":", 1)[-1])
+            if m:
+                candidates.setdefault("text", int(m.group(1)))
+    for key in ("194", "190", "text"):
+        if key in candidates:
+            return candidates[key]
+    return next(iter(candidates.values()), None)
 
 
 def read_nvme_temp() -> TempReading:
@@ -329,12 +439,9 @@ def read_nvme_temp() -> TempReading:
                     text=True,
                     timeout=SUBPROCESS_TIMEOUT,
                 )
-                for line in out.splitlines():
-                    if "temperature" in line.lower():
-                        m = re.search(r"(-?\d+)", line)
-                        if m:
-                            temps.append(int(m.group(1)))
-                            break
+                t = plausible(_parse_nvme_temp(out), f"nvme smart-log {dev}")
+                if t is not None:
+                    temps.append(t)
             except subprocess.TimeoutExpired:
                 _mark_missing(f"nvme:{dev}")
             except (OSError, subprocess.SubprocessError):
@@ -357,8 +464,11 @@ def read_nvme_temp() -> TempReading:
 
         for f in sorted(glob.glob(os.path.join(hw, "temp*_input"))):
             v = _read_int(f)
-            if v is not None:
-                temps.append(scale_temp(v, millidegrees=True))
+            if v is None:
+                continue
+            t = plausible(scale_temp(v, millidegrees=True), f)
+            if t is not None:
+                temps.append(t)
 
     return max(temps) if temps else None
 
@@ -398,16 +508,9 @@ def read_drive_temp() -> TempReading:
         except (OSError, subprocess.SubprocessError):
             continue
 
-        for line in out.splitlines():
-            # ATA attributes: temperature often in the last column of a row
-            # that mentions "Temperature_Celsius" or similar.
-            if "temperature" in line.lower():
-                m = re.findall(r"(-?\d+)", line)
-                if m:
-                    # smartctl reports whole degrees Celsius for ATA; take the
-                    # last numeric column (raw is last)
-                    temps.append(int(m[-1]))
-                    break
+        t = plausible(_parse_smartctl_temp(out), f"smartctl {dev}")
+        if t is not None:
+            temps.append(t)
 
     return max(temps) if temps else None
 
@@ -627,6 +730,7 @@ class LoopState:
     shutdown_sent: bool = False
     shutdown_attempts: int = 0
     last_shutdown_error_log: float = float("-inf")
+    overheat_streak: int = 0  # consecutive over-threshold iterations
 
 
 def decide(snapshot: SensorSnapshot, config: FanConfig, *, last_pwm: Optional[int]) -> LoopDecision:
@@ -713,11 +817,32 @@ def run_loop_iteration(deps: LoopDeps, state: LoopState, config: FanConfig) -> L
             state.last_log_time = now
             state.last_state_key = state_key
 
-        if decision.should_shutdown and not state.shutdown_sent:
+        # Debounce: a single glitched reading (e.g. a sensor that is not yet
+        # initialised during boot) must not power the board off; require
+        # overheat_confirm consecutive over-threshold iterations.
+        if decision.should_shutdown:
+            state.overheat_streak += 1
+            if state.overheat_streak < config.overheat_confirm:
+                logger.warning(
+                    "Overheat reading %s/%s (temp=%s°C): %s",
+                    state.overheat_streak,
+                    config.overheat_confirm,
+                    snapshot.max_temp,
+                    decision.status,
+                )
+        else:
+            state.overheat_streak = 0
+        overheat_confirmed = (
+            decision.should_shutdown and state.overheat_streak >= config.overheat_confirm
+        )
+
+        if overheat_confirmed and not state.shutdown_sent:
             state.shutdown_attempts += 1
             if state.shutdown_attempts == 1:
                 logger.critical(
-                    "Overheat threshold reached: shutting down (temp=%s)", snapshot.max_temp
+                    "Overheat threshold reached: shutting down (temp=%s°C; %s)",
+                    snapshot.max_temp,
+                    decision.status,
                 )
             if bool(deps.shutdown_fn()):
                 state.shutdown_sent = True
@@ -769,12 +894,13 @@ def main(
 
     logger.info(
         "fan_control.py started (sleep=%ss, curve=%s, overheat=%s, "
-        "overheat_threshold=%s, pwm_hysteresis=%s, verbose=%s, "
+        "overheat_threshold=%s, overheat_confirm=%s, pwm_hysteresis=%s, verbose=%s, "
         "pwm_min=%s, pwm_max=%s, tmin=%s, tmax=%s)",
         config.sleep,
         config.curve,
         config.overheat,
         config.overheat_threshold,
+        config.overheat_confirm,
         config.pwm_hysteresis,
         config.verbose,
         config.pwm_min,

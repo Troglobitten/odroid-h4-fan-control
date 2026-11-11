@@ -93,7 +93,7 @@ def test_shutdown_invoked_once_with_flag(make_config):
 def test_shutdown_failure_retries_and_loop_keeps_running(make_config, caplog):
     # H2: a failed shutdown must NOT stop the daemon — it retries every
     # cycle while the fan stays under control at pwm_max.
-    cfg = make_config(overheat=True, overheat_threshold=95)
+    cfg = make_config(overheat=True, overheat_threshold=95, overheat_confirm=1)
     shutdown_calls = {"n": 0}
 
     def fail_shutdown():

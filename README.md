@@ -17,8 +17,12 @@ overheat shutdown, and bounded journal logging.
 - **Manual mode at startup:** the script sets `pwmN_enable = 1` when the node exists, so
   PWM writes actually take effect instead of being ignored by automatic/thermal control.
 - **Overheat protection** (opt-in via `-o`): shuts down at `--overheat-threshold`
-  (default **95 °C**, exact comparison, no hidden margin). If the shutdown command
-  fails, the script **keeps running** (fan held at max) and retries every cycle.
+  (default **95 °C**, exact comparison, no hidden margin) once it has been reached on
+  `--overheat-confirm` consecutive readings (default **3**), so a single glitched
+  sensor value cannot power the board off. If the shutdown command fails, the script
+  **keeps running** (fan held at max) and retries every cycle.
+- **Plausibility filter:** readings outside **−40…150 °C** (uninitialised sensors,
+  packed SMART raw values) are discarded with a rate-limited `WARNING`.
 - **Hysteresis:** PWM is only rewritten when it changes by more than `--pwm-hysteresis`
   (default **2**), reducing sysfs churn.
 - **Bounded logging:** a status line on every PWM/fail-safe state change, plus a
@@ -26,7 +30,7 @@ overheat shutdown, and bounded journal logging.
 - **Robust sensor probing:** absent or hung sources/devices are cached for **60 s** and
   re-probed afterwards (a dead NVMe or SATA drive can't stall the loop forever).
 - Auto-detects the PWM sysfs node (prefers `it8613`/`it87`, re-resolves if it vanishes).
-- **Import-safe & testable:** no side effects at import time; **103** pytest cases, all
+- **Import-safe & testable:** no side effects at import time; **127** pytest cases, all
   hardware I/O mocked; CI runs on every push.
 
 ---
@@ -94,8 +98,10 @@ sudo chmod +x /opt/odroid-fan/fan_control.py
 # 1. Show all options (works without root)
 python3 /opt/odroid-fan/fan_control.py --help
 
-# 2. Short test run (Ctrl+C stops it)
-sudo python3 /opt/odroid-fan/fan_control.py -v
+# 2. Short test run with EXACTLY the flags the service will use (Ctrl+C stops it).
+#    Include -o here: overheat shutdown is only active with -o, so a test run
+#    without it cannot reveal a sensor that would power the board off.
+sudo python3 /opt/odroid-fan/fan_control.py -v -o -c lin --tmin 40 --tmax 80 --pwm-min 30 --pwm-max 128 --overheat-threshold 95 --pwm-hysteresis 2
 ```
 
 A healthy run looks like this:
@@ -115,6 +121,8 @@ What to check:
 | `Set ..._enable = 1 (manual mode; ...)` | The script switched the channel to manual control. |
 | `No PWM sysfs path found` | No PWM node detected — see [Troubleshooting](#troubleshooting). |
 | `CPU: ... PWM: ...` | A status line; PWM should rise when the CPU heats up. |
+| `Ignoring implausible temperature ...` | A sensor returns garbage; it is ignored. Note which one. |
+| `Overheat reading 1/3 ...` | A reading hit the threshold — **do not install the service** until you know why. |
 
 If everything looks right, press `Ctrl+C` and continue.
 
@@ -125,15 +133,20 @@ Create `/etc/systemd/system/fancontrol.service`:
 ```ini
 [Unit]
 Description=ODROID H4 Fan Control Python Service
-# Start after the filesystems and basic system init are available
-After=sysinit.target local-fs.target
+# Start only after /etc/modules-load.d (it87) has been processed and udev has
+# created the hwmon devices; the PWM path is resolved once at startup.
+After=systemd-modules-load.service systemd-udev-settle.service local-fs.target
+Wants=systemd-modules-load.service
+# Stop restarting after 5 failures in 60 s instead of looping forever.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 WorkingDirectory=/opt/odroid-fan
 ExecStart=/usr/bin/python3 /opt/odroid-fan/fan_control.py -v -o -c lin --tmin 40 --tmax 80 --pwm-min 30 --pwm-max 128 --overheat-threshold 95 --pwm-hysteresis 2
 Restart=always
-RestartSec=2
+RestartSec=5
 # Fan control must write to /sys/class/hwmon, which requires root.
 # Additional hardening below restricts everything else.
 User=root
@@ -210,6 +223,7 @@ sudo rm -rf /opt/odroid-fan
 | `-t`, `--sleep <seconds>` | Sleep interval between checks (default **2**, must be > 0). |
 | `-o`, `--overheat` | Enable overheat protection (shutdown when threshold reached). |
 | `--overheat-threshold <°C>` | Shutdown threshold (default **95**). Triggers **exactly** at this temperature; must be ≥ 0. |
+| `--overheat-confirm <n>` | Consecutive over-threshold readings required before shutdown (default **3**, must be ≥ 1). |
 | `--pwm-hysteresis <value>` | Only rewrite PWM when it changes by more than this (default **2**, must be ≥ 0). |
 | `-c`, `--curve <lin\|log\|exp>` | Fan curve type (default `lin`). |
 | `--pwm-min <value>` | Minimum PWM value (default `20`, range `0..255`). |
@@ -274,7 +288,7 @@ is mocked**, so it runs anywhere (Linux, Windows, CI).
 # install the package in editable mode with dev tools (pytest + ruff)
 python3 -m pip install -e ".[dev]"
 
-# run the suite (103 tests, ~0.2 s; a 30 s faulthandler guard fails hangs fast)
+# run the suite (127 tests, ~0.2 s; a 30 s faulthandler guard fails hangs fast)
 python3 -m pytest
 
 # lint
@@ -293,6 +307,26 @@ CI (`.github/workflows/ci.yml`) runs ruff + pytest on every push and pull reques
 against Python 3.8, 3.11, and 3.13.
 
 ## Troubleshooting
+
+**Board powers off / "crashes" during boot as soon as the service is enabled, but the
+manual test was fine** — almost always the overheat shutdown (`-o`) firing on a bogus
+sensor value at boot; a manual run without `-o` cannot trigger it. Recover by booting
+into recovery/maintenance mode and running `systemctl disable fancontrol.service`,
+then look at the log of the boot that went down:
+
+```bash
+# previous boot (needs a persistent journal: sudo mkdir -p /var/log/journal)
+sudo journalctl -b -1 -u fancontrol.service -o short-iso-precise
+# was it a clean shutdown or a real crash?
+last -x | head
+```
+
+`Overheat threshold reached: shutting down (...)` names every sensor value at that
+moment. Current versions ignore readings outside −40…150 °C and need
+`--overheat-confirm` (default 3) consecutive hits, so a single glitch no longer powers
+the board off. Update (`git pull`), re-run step 3 **with `-o`**, then re-enable the
+service. If the log shows no fancontrol lines at all before the hang, it is a kernel
+problem (usually `it87` with `force_id`): check `journalctl -b -1 -k -p err`.
 
 **`No PWM sysfs path found` in the log** — no fan controller node was detected.
 List what the system exposes:
