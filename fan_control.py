@@ -8,8 +8,13 @@ Features:
   absent/hung sources are cached with a 60 s TTL and re-probed afterwards
 - Auto-detect PWM sysfs (prefers it8613/it87); resolved lazily, not at import,
   re-resolved if the path vanishes; PWM channel forced to manual mode at startup
-- Writes PWM only when changed (with hysteresis gate)
-- Fail-safe: all sensors unavailable -> fan at pwm_max, not off
+- Writes PWM only when changed (hysteresis measured against the last value
+  actually written, so slow drifts are never lost)
+- On exit (SIGTERM/Ctrl+C) the fan is handed back to automatic control or set
+  to full speed - never left frozen at the last manual value
+- Emergencies (all sensors unavailable, overheat threshold reached with -o,
+  unhandled loop error) -> fan at full speed (PWM 255), ignoring --pwm-max
+- smartctl / nvme-cli results are cached for 30 s (no process spawn per loop)
 - Logging: status line on PWM/fail-safe state change + 30 s heartbeat;
   entering fail-safe logs one ERROR, not one per iteration
 - Overheat shutdown: retried each cycle until the system actually goes down
@@ -25,6 +30,7 @@ import logging
 import math
 import os
 import re
+import signal
 import subprocess
 import time
 from dataclasses import dataclass
@@ -39,6 +45,13 @@ CurveMethod = Literal["lin", "log", "exp"]
 LOG_REPORT_INTERVAL = 30.0  # seconds between heartbeat status lines
 SUBPROCESS_TIMEOUT = 5  # seconds
 MISSING_CACHE_TTL = 60.0  # seconds before an "absent source" is re-probed
+# Drive/NVMe temperatures come from external tools (smartctl, nvme-cli) and
+# change slowly; their results are reused for this long instead of spawning
+# a process per device on every loop iteration.
+DRIVE_TEMP_CACHE_TTL = 30.0
+# Hardware maximum. Used for emergencies regardless of --pwm-max, which only
+# limits the normal curve (typically for noise).
+PWM_FULL = 255
 # Readings outside this window are sensor glitches (e.g. a packed SMART raw
 # value or an uninitialised sensor at boot), never real temperatures. They are
 # discarded so a bogus value can neither drive the curve nor trigger an
@@ -112,6 +125,7 @@ class LoopDecision:
     should_shutdown: bool
     status: str
     fail_safe: bool = False
+    full_speed: bool = False  # emergency: write PWM_FULL, bypassing --pwm-max
 
 
 # -------------------------
@@ -274,6 +288,22 @@ def _mark_missing(key: str) -> None:
     _missing_path_cache[key] = time.monotonic() + MISSING_CACHE_TTL
 
 
+# source key -> (monotonic expiry, reading). Holds the last result of the
+# subprocess-based readers, including None, for DRIVE_TEMP_CACHE_TTL.
+_reading_cache: Dict[str, Tuple[float, TempReading]] = {}
+
+
+def _cached_reading(key: str, probe: Callable[[], TempReading]) -> TempReading:
+    """Return the cached result for ``key`` or run ``probe`` and cache it."""
+    now = time.monotonic()
+    hit = _reading_cache.get(key)
+    if hit is not None and now < hit[0]:
+        return hit[1]
+    value = probe()
+    _reading_cache[key] = (now + DRIVE_TEMP_CACHE_TTL, value)
+    return value
+
+
 def read_cpu_temp() -> TempReading:
     """
     Prefer coretemp / hwmon CPU sensors (Package/Core). Fallbacks: thermal_zone,
@@ -420,7 +450,8 @@ def _parse_smartctl_temp(out: str) -> TempReading:
     return next(iter(candidates.values()), None)
 
 
-def read_nvme_temp() -> TempReading:
+def _probe_nvme_cli_temp() -> TempReading:
+    """Hottest composite temperature across all NVMe devices via nvme-cli."""
     temps = []
 
     # Try all NVMe namespaces via nvme-cli; cache absence of devices (#9) and
@@ -447,9 +478,16 @@ def read_nvme_temp() -> TempReading:
             except (OSError, subprocess.SubprocessError):
                 pass
 
-    if temps:
-        return max(temps)
+    return max(temps) if temps else None
 
+
+def read_nvme_temp() -> TempReading:
+    """NVMe temperature: nvme-cli (cached for DRIVE_TEMP_CACHE_TTL), else hwmon."""
+    cli = _cached_reading("nvme_cli", _probe_nvme_cli_temp)
+    if cli is not None:
+        return cli
+
+    temps = []
     # Fallback: hwmon (always millidegrees per source contract)
     for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
         name = ""
@@ -474,6 +512,11 @@ def read_nvme_temp() -> TempReading:
 
 
 def read_drive_temp() -> TempReading:
+    """Drive temperature via smartctl, cached for DRIVE_TEMP_CACHE_TTL."""
+    return _cached_reading("drive", _probe_drive_temp)
+
+
+def _probe_drive_temp() -> TempReading:
     """Best-effort drive temperature via ``smartctl -A`` on /dev/sd* (#17).
 
     Returns None when smartctl is unavailable, no drive is present, or no
@@ -493,8 +536,10 @@ def read_drive_temp() -> TempReading:
         if _probe_missing(f"sd:{dev}"):
             continue
         try:
+            # -n standby: never spin up a sleeping disk just to read its
+            # temperature (smartctl then exits 2 without attribute output).
             out = subprocess.check_output(
-                ["smartctl", "-A", dev],
+                ["smartctl", "-A", "-n", "standby", dev],
                 stderr=subprocess.DEVNULL,
                 text=True,
                 timeout=SUBPROCESS_TIMEOUT,
@@ -505,6 +550,12 @@ def read_drive_temp() -> TempReading:
         except subprocess.TimeoutExpired:
             _mark_missing(f"sd:{dev}")  # hung device: back off for one TTL (M3)
             continue
+        except subprocess.CalledProcessError as exc:
+            # smartctl's exit status is a bit mask: e.g. bit 6 ("error log
+            # contains errors") is set permanently on many healthy-enough
+            # drives although the attribute table was printed fine. Parse
+            # whatever output there is instead of dropping the reading.
+            out = exc.output if isinstance(exc.output, str) else ""
         except (OSError, subprocess.SubprocessError):
             continue
 
@@ -522,18 +573,21 @@ _pwm_path_resolved = False
 
 
 def get_pwm_path() -> Optional[str]:
-    """Lazy accessor: resolve PWM sysfs path once, on first call (#5).
+    """Lazy accessor: resolve PWM sysfs path on first call, not at import (#5).
 
-    Re-resolves immediately if a previously detected path has vanished
-    (e.g. driver reload), so a stale path cannot disable fan control (L2).
+    Re-probes whenever no path is known yet (driver loaded after the daemon
+    started, e.g. early in boot) or a previously detected path has vanished
+    (driver reload), so neither case can disable fan control for the
+    lifetime of the process (L2).
     """
     global _pwm_path_cache, _pwm_path_resolved
-    if not _pwm_path_resolved:
+    if (
+        not _pwm_path_resolved
+        or _pwm_path_cache is None
+        or not os.path.exists(_pwm_path_cache)
+    ):
         _pwm_path_cache = find_pwm_path()
         _pwm_path_resolved = True
-    elif _pwm_path_cache is not None and not os.path.exists(_pwm_path_cache):
-        _pwm_path_cache = find_pwm_path()
-        _pwm_path_resolved = _pwm_path_cache is not None
     return _pwm_path_cache
 
 
@@ -560,6 +614,39 @@ def find_pwm_path(
     return None
 
 
+# enable-file path -> value found before this daemon first touched it
+_pwm_original_enable: Dict[str, int] = {}
+
+
+def release_pwm(pwm_path: Optional[str], *, full_speed: bool = False) -> None:
+    """Leave the fan in a safe state when the daemon stops.
+
+    Without this the channel stays in manual mode frozen at the last PWM
+    value (possibly pwm_min) with nothing controlling it any more. Preferred:
+    restore the enable value found at startup (hand control back to the
+    chip's automatic mode). If the channel was already manual, or the restore
+    fails, or ``full_speed`` is requested (overheat shutdown), write PWM 255.
+    """
+    if not pwm_path:
+        return
+    enable_path = pwm_path + "_enable"
+    original = _pwm_original_enable.get(enable_path)
+    if not full_speed and original is not None and original != 1:
+        try:
+            with open(enable_path, "w") as f:
+                f.write(str(original))
+            logger.info("Restored %s = %s on exit", enable_path, original)
+            return
+        except OSError as exc:
+            logger.warning("Could not restore %s = %s: %s", enable_path, original, exc)
+    try:
+        with open(pwm_path, "w") as f:
+            f.write("255")
+        logger.info("Set %s = 255 (full speed) on exit", pwm_path)
+    except OSError as exc:
+        logger.warning("Could not set %s to full speed on exit: %s", pwm_path, exc)
+
+
 def ensure_manual_pwm_mode(pwm_path: str) -> bool:
     """Force the PWM channel into manual mode at startup (M4).
 
@@ -575,6 +662,7 @@ def ensure_manual_pwm_mode(pwm_path: str) -> bool:
             "No readable pwm enable file at %s; skipping manual-mode setup", enable_path
         )
         return True
+    _pwm_original_enable.setdefault(enable_path, current)
     if current == 1:
         return True
     try:
@@ -594,8 +682,16 @@ def ensure_manual_pwm_mode(pwm_path: str) -> bool:
 
 
 def write_pwm(value: int, config: FanConfig, path: Optional[str]) -> bool:
-    """Write a clamped PWM value to ``path``. Returns success (#7)."""
-    v = int(max(min(value, config.pwm_max), config.pwm_min))
+    """Write a PWM value clamped to --pwm-min..--pwm-max. Returns success (#7)."""
+    return _write_pwm_raw(int(max(min(value, config.pwm_max), config.pwm_min)), path)
+
+
+def write_pwm_full(path: Optional[str]) -> bool:
+    """Emergency write: PWM_FULL, deliberately not limited by --pwm-max."""
+    return _write_pwm_raw(PWM_FULL, path)
+
+
+def _write_pwm_raw(v: int, path: Optional[str]) -> bool:
     if path:
         try:
             with open(path, "w") as f:
@@ -706,6 +802,17 @@ class LoopDeps:
     # Real wiring only (None in tests): re-resolves the sysfs path when the
     # detected node vanishes mid-run (L2).
     refresh_path: Optional[Callable[[], Optional[str]]] = None
+    # Real wiring only: called once when the loop ends, with True when an
+    # overheat shutdown was sent (-> full speed instead of automatic mode).
+    release_fn: Optional[Callable[[bool], None]] = None
+    # Emergency writer (PWM_FULL, not clamped to --pwm-max). When None, the
+    # value PWM_FULL is passed to write_pwm_fn instead (test fakes).
+    write_full_fn: Optional[Callable[[Optional[str]], bool]] = None
+
+    def write_full(self, config: FanConfig, path: Optional[str]) -> bool:
+        if self.write_full_fn is not None:
+            return self.write_full_fn(path)
+        return self.write_pwm_fn(PWM_FULL, config, path)
 
     @classmethod
     def real(cls) -> LoopDeps:
@@ -716,9 +823,13 @@ class LoopDeps:
             write_pwm_fn=write_pwm,
             shutdown_fn=_shutdown,
             sleep_fn=time.sleep,
-            clock=time.time,
+            # monotonic: wall-clock jumps (NTP sync after boot, no RTC
+            # battery) must not disturb heartbeat/rate-limit timing
+            clock=time.monotonic,
             pwm_path=get_pwm_path(),
             refresh_path=get_pwm_path,
+            release_fn=lambda full_speed: release_pwm(get_pwm_path(), full_speed=full_speed),
+            write_full_fn=write_pwm_full,
         )
 
 
@@ -742,28 +853,53 @@ def decide(snapshot: SensorSnapshot, config: FanConfig, *, last_pwm: Optional[in
 
     if max_temp is None:
         # Fail-safe: all sensors unavailable -> full speed, not off (#3).
+        # PWM_FULL, not --pwm-max: that limit is for noise in normal
+        # operation, not for running blind.
         status = (
             f"CPU: {cpu_str}  Drive: {drive_str}  NVMe: {nvme_str}  "
-            f"PWM: {config.pwm_max} (fail-safe: no readings)"
+            f"PWM: {PWM_FULL} (fail-safe: no readings)"
         )
         return LoopDecision(
-            pwm=config.pwm_max,
-            should_write=last_pwm != config.pwm_max,
+            pwm=PWM_FULL,
+            should_write=last_pwm != PWM_FULL,
             should_shutdown=False,
             status=status,
             fail_safe=True,
+            full_speed=True,
         )
 
     pwm = compute_pwm_from_temp(max_temp, config.curve, config)
 
     # Overheat at the exact threshold — no hidden margin (#2).
     should_shutdown = config.overheat and max_temp >= config.overheat_threshold
+    if should_shutdown:
+        # Full speed from the first over-threshold reading on, i.e. already
+        # while the shutdown is still waiting for --overheat-confirm.
+        status = (
+            f"CPU: {cpu_str}  Drive: {drive_str}  NVMe: {nvme_str}  "
+            f"PWM: {PWM_FULL} (overheat: full speed)"
+        )
+        return LoopDecision(
+            pwm=PWM_FULL,
+            should_write=last_pwm != PWM_FULL,
+            should_shutdown=True,
+            status=status,
+            fail_safe=False,
+            full_speed=True,
+        )
 
-    # Hysteresis: rewrite only when delta > threshold (#14).
-    if last_pwm is None:
+    # Hysteresis: rewrite only when the target differs from the value that
+    # was last *written* by more than the threshold (#14). Inside the band
+    # the applied value is held (and reported), so the reference never
+    # drifts with unwritten targets. The curve end points always snap, so
+    # the fan reliably reaches pwm_min / pwm_max.
+    at_end_point = pwm in (config.pwm_min, config.pwm_max)
+    if last_pwm is None or (at_end_point and pwm != last_pwm):
         should_write = True
     else:
         should_write = abs(pwm - last_pwm) > config.pwm_hysteresis
+        if not should_write:
+            pwm = last_pwm
 
     status = f"CPU: {cpu_str}  Drive: {drive_str}  NVMe: {nvme_str}  PWM: {pwm}"
     return LoopDecision(
@@ -778,25 +914,34 @@ def decide(snapshot: SensorSnapshot, config: FanConfig, *, last_pwm: Optional[in
 def run_loop_iteration(deps: LoopDeps, state: LoopState, config: FanConfig) -> LoopState:
     """One loop iteration: read -> decide -> act -> log (#6)."""
     try:
+        # Resolve the sysfs node first: (re)probe while none is known (driver
+        # loaded after startup) or when the known node vanished (driver
+        # reload) (L2). A newly adopted node gets manual mode and a forced
+        # write; nothing written to the old/absent node counts for it.
+        path = deps.pwm_path
+        if deps.refresh_path is not None and (path is None or not os.path.exists(path)):
+            refreshed = deps.refresh_path()
+            if refreshed and refreshed != path:
+                logger.info("Using PWM sysfs path: %s", refreshed)
+                ensure_manual_pwm_mode(refreshed)
+                deps.pwm_path = path = refreshed
+                state.last_pwm = None
+
         snapshot = SensorSnapshot.from_readings(
             deps.read_cpu(), deps.read_drive(), deps.read_nvme()
         )
         decision = decide(snapshot, config, last_pwm=state.last_pwm)
 
-        # Resolve the sysfs node for this write; refresh it if the previously
-        # detected node vanished (driver reload) (L2).
-        path = deps.pwm_path
-        if deps.refresh_path is not None and path is not None and not os.path.exists(path):
-            refreshed = deps.refresh_path()
-            if refreshed:
-                path = refreshed
-
+        # Only successful writes advance the cache (#7): after a failed write
+        # the next iteration retries, and without a write last_pwm stays the
+        # value that is actually on the fan.
         if decision.should_write:
-            if deps.write_pwm_fn(decision.pwm, config, path):
-                state.last_pwm = decision.pwm  # only cache successful writes (#7)
-            # on failure: do NOT advance cache; retry next iteration
-        else:
-            state.last_pwm = decision.pwm
+            if decision.full_speed:
+                written = deps.write_full(config, path)
+            else:
+                written = deps.write_pwm_fn(decision.pwm, config, path)
+            if written:
+                state.last_pwm = decision.pwm
 
         now = deps.clock()
         # Logging (#10): a status line is forced on PWM/fail-safe state
@@ -811,6 +956,18 @@ def run_loop_iteration(deps: LoopDeps, state: LoopState, config: FanConfig) -> L
         # status line (which carries the fail-safe marker) covers the rest.
         if decision.fail_safe and state_changed:
             logger.error("No temperature readings available; fail-safe: PWM=%s", decision.pwm)
+
+        # Something else (resume from suspend, firmware) may flip the channel
+        # back to automatic mode, where PWM writes are ignored. Check once per
+        # heartbeat and force a rewrite if manual mode had to be re-asserted.
+        if (
+            heartbeat_due
+            and path
+            and deps.refresh_path is not None
+            and _read_int(path + "_enable") not in (None, 1)
+        ):
+            ensure_manual_pwm_mode(path)
+            state.last_pwm = None
 
         if state_changed or heartbeat_due:
             logger.info(decision.status)
@@ -864,8 +1021,20 @@ def run_loop_iteration(deps: LoopDeps, state: LoopState, config: FanConfig) -> L
         raise
     except Exception:
         logger.exception("Unhandled exception in main loop")
+        # Fail safe: while the loop is broken nothing tracks the temperature,
+        # so do not leave the fan at a stale (possibly minimal) speed.
+        try:
+            if deps.write_full(config, deps.pwm_path):
+                state.last_pwm = PWM_FULL
+        except Exception:
+            logger.debug("fail-safe PWM write failed", exc_info=True)
         deps.sleep_fn(max(config.sleep, 5))  # configured backoff
         return state
+
+
+def _raise_keyboard_interrupt(signum: int, frame: object) -> None:
+    """SIGTERM handler: unwind like Ctrl+C so the exit path runs."""
+    raise KeyboardInterrupt
 
 
 def main(
@@ -884,13 +1053,16 @@ def main(
 
     if deps is None:
         deps = LoopDeps.real()
+        # `systemctl stop` sends SIGTERM; Python's default action would kill
+        # the process without running the exit path below.
+        signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
 
     # Startup diagnostics at INFO (#11).
     if deps.pwm_path:
         logger.info("Using PWM sysfs path: %s", deps.pwm_path)
         ensure_manual_pwm_mode(deps.pwm_path)  # pwm writes need manual mode (M4)
     else:
-        logger.error("No PWM sysfs path found; write_pwm will only log")
+        logger.error("No PWM sysfs path found yet; will keep probing every cycle")
 
     logger.info(
         "fan_control.py started (sleep=%ss, curve=%s, overheat=%s, "
@@ -911,19 +1083,21 @@ def main(
 
     state = LoopState()
     iterations = 0
-    while True:
-        if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
-            break
-        if max_iterations is not None and iterations >= max_iterations:
-            break
-        try:
+    try:
+        while True:
+            if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                break
+            if max_iterations is not None and iterations >= max_iterations:
+                break
             state = run_loop_iteration(deps, state, config)
             iterations += 1
-        except KeyboardInterrupt:
-            logger.info("fan_control.py interrupted by user")
-            break
-        if state.shutdown_sent:
-            break
+            if state.shutdown_sent:
+                break
+    except KeyboardInterrupt:
+        logger.info("fan_control.py interrupted (Ctrl+C / SIGTERM); stopping")
+    finally:
+        if deps.release_fn is not None:
+            deps.release_fn(state.shutdown_sent)
 
 
 if __name__ == "__main__":

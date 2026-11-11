@@ -16,9 +16,11 @@ def _reset_missing_cache():
     """Reset the module-level negative-result cache between tests."""
     fan_control._missing_path_cache.clear()
     fan_control._implausible_logged.clear()
+    fan_control._reading_cache.clear()
     yield
     fan_control._missing_path_cache.clear()
     fan_control._implausible_logged.clear()
+    fan_control._reading_cache.clear()
 
 
 @pytest.fixture

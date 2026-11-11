@@ -12,25 +12,36 @@ overheat shutdown, and bounded journal logging.
 - Controls fan speed from **CPU**, **Drive** (best-effort, needs `smartctl`), and **NVMe**
   temperatures — always uses the **hottest** available reading.
 - Three fan curves: **linear**, **logarithmic**, **exponential** (`-c lin|log|exp`).
-- **Fail-safe:** if *all* sensors are unavailable, the fan runs at **maximum** speed —
-  never off — and one `ERROR` is logged on entering that state.
-- **Manual mode at startup:** the script sets `pwmN_enable = 1` when the node exists, so
-  PWM writes actually take effect instead of being ignored by automatic/thermal control.
+- **Fail-safe:** if *all* sensors are unavailable, the fan runs at **full speed**
+  (PWM 255, regardless of `--pwm-max`) — never off — and one `ERROR` is logged on
+  entering that state.
+- **Manual mode:** the script sets `pwmN_enable = 1` when the node exists, so PWM
+  writes actually take effect instead of being ignored by automatic/thermal control;
+  it is re-checked every 30 s (e.g. after resume from suspend).
+- **Safe exit:** on `systemctl stop` / `Ctrl+C` the fan is handed back to the chip's
+  automatic mode (the `pwmN_enable` value found at startup) or, if the channel was
+  already manual, set to **full speed** — never left frozen at the last value.
 - **Overheat protection** (opt-in via `-o`): shuts down at `--overheat-threshold`
   (default **95 °C**, exact comparison, no hidden margin) once it has been reached on
   `--overheat-confirm` consecutive readings (default **3**), so a single glitched
-  sensor value cannot power the board off. If the shutdown command fails, the script
-  **keeps running** (fan held at max) and retries every cycle.
+  sensor value cannot power the board off. The fan goes to **full speed** (PWM 255,
+  regardless of `--pwm-max`) from the first over-threshold reading on. If the shutdown
+  command fails, the script **keeps running** (fan at full speed) and retries every
+  cycle.
 - **Plausibility filter:** readings outside **−40…150 °C** (uninitialised sensors,
   packed SMART raw values) are discarded with a rate-limited `WARNING`.
-- **Hysteresis:** PWM is only rewritten when it changes by more than `--pwm-hysteresis`
-  (default **2**), reducing sysfs churn.
+- **Hysteresis:** PWM is only rewritten when the target differs from the value last
+  *written* by more than `--pwm-hysteresis` (default **2**), reducing sysfs churn
+  without ever losing a slow temperature drift.
 - **Bounded logging:** a status line on every PWM/fail-safe state change, plus a
   **30-second heartbeat** while quiet — no per-iteration log spam.
 - **Robust sensor probing:** absent or hung sources/devices are cached for **60 s** and
   re-probed afterwards (a dead NVMe or SATA drive can't stall the loop forever).
-- Auto-detects the PWM sysfs node (prefers `it8613`/`it87`, re-resolves if it vanishes).
-- **Import-safe & testable:** no side effects at import time; **127** pytest cases, all
+- **Light drive polling:** `smartctl` / `nvme` results are reused for **30 s** instead
+  of spawning a process per device every cycle; sleeping disks are not woken up.
+- Auto-detects the PWM sysfs node (prefers `it8613`/`it87`); keeps probing if it is
+  not there yet (driver loaded later) and re-resolves if it vanishes.
+- **Import-safe & testable:** no side effects at import time; **157** pytest cases, all
   hardware I/O mocked; CI runs on every push.
 
 ---
@@ -133,9 +144,9 @@ Create `/etc/systemd/system/fancontrol.service`:
 ```ini
 [Unit]
 Description=ODROID H4 Fan Control Python Service
-# Start only after /etc/modules-load.d (it87) has been processed and udev has
-# created the hwmon devices; the PWM path is resolved once at startup.
-After=systemd-modules-load.service systemd-udev-settle.service local-fs.target
+# Start after /etc/modules-load.d (it87) has been processed. If the hwmon node
+# is still missing, the script keeps probing for it every cycle.
+After=systemd-modules-load.service local-fs.target
 Wants=systemd-modules-load.service
 # Stop restarting after 5 failures in 60 s instead of looping forever.
 StartLimitIntervalSec=60
@@ -182,7 +193,7 @@ systemctl status fancontrol.service
 sudo journalctl -u fancontrol.service -f -o short-iso-precise
 
 # watch the PWM value respond to load (in another shell)
-watch -n1 'cat /sys/class/hwmon/hwmon*/pwm1'
+watch -n1 'grep . /sys/class/hwmon/hwmon*/pwm[0-9]'
 ```
 
 To force the fan up, put some load on the board, e.g.:
@@ -192,7 +203,8 @@ sudo apt install stress-ng
 stress-ng --cpu 4 --timeout 60
 ```
 
-The `pwm1` value should climb while the load runs and fall back afterwards.
+The value of the PWM node named in the `Using PWM sysfs path: ...` log line should
+climb while the load runs and fall back afterwards.
 
 ### Updating
 
@@ -227,7 +239,7 @@ sudo rm -rf /opt/odroid-fan
 | `--pwm-hysteresis <value>` | Only rewrite PWM when it changes by more than this (default **2**, must be ≥ 0). |
 | `-c`, `--curve <lin\|log\|exp>` | Fan curve type (default `lin`). |
 | `--pwm-min <value>` | Minimum PWM value (default `20`, range `0..255`). |
-| `--pwm-max <value>` | Maximum PWM value (default `255`, range `0..255`). |
+| `--pwm-max <value>` | Maximum PWM value of the normal curve (default `255`, range `0..255`). Emergencies (fail-safe, overheat with `-o`, loop error) use PWM 255 regardless. |
 | `--tmin <°C>` / `--tmax <°C>` | Temperature range for the curve (default `30`/`80`, `tmin` must be < `tmax`). |
 
 Invalid values (e.g. `--tmin >= --tmax`, `--sleep <= 0`, PWM outside `0..255`,
@@ -257,13 +269,29 @@ sudo journalctl -u fancontrol.service -f -o short-iso-precise
   zones (hottest wins) → `sensors` output. NVMe uses `nvme smart-log` with an hwmon
   fallback; drives use `smartctl -A` (best-effort, reported as `N/A` if unavailable).
 - **Aggregation:** the hottest reading across CPU/Drive/NVMe drives the curve. If *all*
-  sensors are unavailable the script fails safe to **maximum** PWM.
-- **PWM write only on change:** the value is rewritten only when the delta exceeds
-  `--pwm-hysteresis`; failed writes are retried on the next cycle (the cache only
-  advances on success).
-- **Manual mode:** at startup the script writes `1` to `<pwm-path>_enable` if that file
-  exists and isn't already `1`, logging the change — automatic/thermal firmware control
-  would otherwise silently ignore PWM writes.
+  sensors are unavailable the script fails safe to **full speed** (PWM 255).
+- **Emergency speed:** `--pwm-max` only limits the normal curve. In fail-safe, at or
+  above `--overheat-threshold` with `-o` set, and after an unhandled loop error the
+  fan is driven at PWM **255**. Without `-o` the threshold is ignored and the curve
+  maximum applies. The fan returns to the curve as soon as the condition clears.
+- **PWM write only on change:** the value is rewritten only when the target differs
+  from the value last written by more than `--pwm-hysteresis`; inside that band the
+  applied value is held (and that is what the status line shows). The curve end
+  points `--pwm-min` / `--pwm-max` are always written exactly. Failed writes are
+  retried on the next cycle (the cache only advances on success).
+- **Manual mode:** the script writes `1` to `<pwm-path>_enable` if that file exists and
+  isn't already `1`, logging the change — automatic/thermal firmware control would
+  otherwise silently ignore PWM writes. Checked at startup, whenever a new PWM node is
+  adopted, and on every 30 s heartbeat.
+- **Exit:** when the script stops (`SIGTERM` from `systemctl stop`, `Ctrl+C`), it
+  restores the `pwmN_enable` value it found at startup. If that was already `1`
+  (manual), or after an overheat shutdown, it writes PWM **255** instead. A
+  `systemctl restart` therefore causes a short full-speed burst on such boards.
+- **Drive polling:** `smartctl` and `nvme smart-log` results (including "no
+  reading") are cached for **30 s**, so the fan reacts to drive/NVMe temperature
+  changes with up to 30 s delay; CPU temperature and the NVMe hwmon fallback are read
+  from sysfs every cycle. `smartctl -A -n standby` is used, so a sleeping disk is
+  never spun up just to read its temperature (it shows as `N/A` while in standby).
 - **Logging cadence:** a status line on every PWM/fail-safe state change, plus a
   heartbeat every **30 s** while nothing changes; entering fail-safe logs a single
   `ERROR`. With the default 2 s interval, journal volume stays bounded.
@@ -271,11 +299,11 @@ sudo journalctl -u fancontrol.service -f -o short-iso-precise
   (per device), then re-probed — so a drive added after startup is picked up, and a
   hanging `smartctl`/`nvme` call can't stall every loop.
 - **Overheat shutdown** only happens with `-o` set. The first attempt logs `CRITICAL`;
-  if the `shutdown` command fails, the loop keeps the fan at max and retries, logging at
-  most one `ERROR` per 30 s.
+  if the `shutdown` command fails, the loop keeps the fan at full speed and retries,
+  logging at most one `ERROR` per 30 s.
 - **Loop robustness:** `sleep` is the last call of every iteration; unhandled
-  exceptions are logged and backed off (`max(sleep, 5)` seconds); `Ctrl+C` exits
-  cleanly.
+  exceptions are logged, the fan is set to full speed (PWM 255), and the loop backs off
+  (`max(sleep, 5)` seconds); `Ctrl+C` exits cleanly.
 
 ---
 
@@ -288,7 +316,7 @@ is mocked**, so it runs anywhere (Linux, Windows, CI).
 # install the package in editable mode with dev tools (pytest + ruff)
 python3 -m pip install -e ".[dev]"
 
-# run the suite (127 tests, ~0.2 s; a 30 s faulthandler guard fails hangs fast)
+# run the suite (157 tests, ~0.2 s; a 30 s faulthandler guard fails hangs fast)
 python3 -m pytest
 
 # lint
@@ -343,8 +371,9 @@ for h in /sys/class/hwmon/hwmon*; do echo -n "$h: "; cat $h/name 2>/dev/null || 
   step 1 handles both automatically). If `modprobe it87` fails with `No such device`,
   the in-tree driver could not claim the chip — install the DKMS module from step 1,
   or force detection with `sudo modprobe it87 force_id=0x<ID>` using the chip ID
-  reported by `sudo sensors-detect`. Always load the module **before** restarting
-  the service — the PWM path is resolved once at startup.
+  reported by `sudo sensors-detect`. The service does not need a restart
+  afterwards: while no PWM node is known it probes for one every cycle and logs
+  `Using PWM sysfs path: ...` once it appears.
 - Entries exist but the wrong chip is picked → adjust the `preferred_names` tuple in
   `find_pwm_path()` (`fan_control.py`).
 
@@ -369,20 +398,21 @@ thermal zone instead of `coretemp`. Ensure the `coretemp` driver is loaded
 
 **Drive temperatures always show `N/A`** — install `smartmontools`
 (`sudo apt install smartmontools`) and make sure `smartctl` is on `PATH` and the script
-runs as root (the service does).
+runs as root (the service does). A disk in standby also reports `N/A` — it is
+deliberately not woken up.
 
 **NVMe temperatures always show `N/A`** — install `nvme-cli` (`sudo apt install nvme-cli`).
 Remember missing sources are re-probed after at most **60 s**, not immediately.
 
 **Log says `fail-safe: no readings`** — *every* sensor source is unavailable. The fan is
-held at maximum PWM as a precaution. Check the individual sources (previous points) and
+held at full speed (PWM 255) as a precaution. Check the individual sources (previous points) and
 run with `-v` for detail.
 
 **Overheat shutdown never happens** — the feature is opt-in: pass `-o`
 (`--overheat`). Without it the threshold is ignored by design.
 
 **`Overheat shutdown attempt ... failed`** — the `shutdown` command was not available
-or returned an error. The script keeps running with the fan at max and retries; fix the
+or returned an error. The script keeps running with the fan at full speed and retries; fix the
 underlying issue (e.g. systemd/shutdown not present).
 
 ---
