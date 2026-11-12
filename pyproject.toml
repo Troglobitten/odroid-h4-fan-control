@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "odroid-h4-fan-control"
+version = "1.0.0"
+description = "ODROID H4 fan control script"
+readme = "README.md"
+requires-python = ">=3.8"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "ruff>=0.1",
+]
+
+# Flat layout: expose fan_control as a top-level module so `pip install -e .`
+# works (tests are excluded by setuptools' default auto-discovery).
+[tool.setuptools]
+py-modules = ["fan_control"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# faulthandler_timeout: if a test hangs (e.g. the historical import-time loop
+# regression reappears), pytest dumps all thread tracebacks and aborts the run
+# after 30 s instead of blocking the suite forever.
+faulthandler_timeout = 30
+addopts = "-q"
+filterwarnings = [
+    # pytest-asyncio (installed globally, unused here) warns about an unset
+    # option; silence the noise so stderr stays clean.
+    "ignore::pytest.PytestDeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+
+[tool.ruff.lint]
+# UP006/UP007/UP045 suggest PEP 604 (`X | None`) / builtin generics which
+# require py3.9+/3.10+ at runtime; the ODROID target is 3.8, so we keep the
+# typing-module forms. Everything else stays enabled.
+extend-ignore = ["UP006", "UP007", "UP045"]

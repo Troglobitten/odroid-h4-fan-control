@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Python 3.8 (the declared minimum) is only available on 22.04
+          - os: ubuntu-22.04
+            python-version: "3.8"
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.13"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package with dev extras
+        run: python -m pip install -e ".[dev]"
+      - name: Lint
+        run: ruff check fan_control.py tests/
+      - name: Test
+        run: python -m pytest tests/

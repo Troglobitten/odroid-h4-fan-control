@@ -1,0 +1,28 @@
+[Unit]
+Description=ODROID H4 Fan Control Python Service
+# Start after /etc/modules-load.d (it87) has been processed. If the hwmon node
+# is still missing, the script keeps probing for it every cycle.
+After=systemd-modules-load.service local-fs.target
+Wants=systemd-modules-load.service
+# Stop restarting after 5 failures in 60 s instead of looping forever.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/odroid-fan
+ExecStart=/usr/bin/python3 /opt/odroid-fan/fan_control.py -v -o -c lin --tmin 40 --tmax 80 --pwm-min 30 --pwm-max 128 --overheat-threshold 95 --pwm-hysteresis 2
+Restart=always
+RestartSec=5
+# Fan control must write to /sys/class/hwmon, which requires root.
+# Additional hardening below restricts everything else.
+User=root
+ProtectSystem=strict
+ReadWritePaths=/sys/class/hwmon
+PrivateTmp=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fancontrol
+
+[Install]
+WantedBy=multi-user.target
