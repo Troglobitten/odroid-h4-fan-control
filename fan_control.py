@@ -400,8 +400,10 @@ def _parse_nvme_temp(out: str) -> TempReading:
     """Extract the composite temperature in °C from ``nvme smart-log`` output.
 
     Only the line whose key is exactly ``temperature`` counts (not e.g.
-    ``Warning Temperature Time``). Handles both ``38 C (311 Kelvin)`` and
-    ``311 K (38 °C)`` styles by preferring an explicit Celsius value.
+    ``Warning Temperature Time``). The unit is never assumed: nvme-cli 2.x
+    prints **Fahrenheit** under US locales (``105 °F (314 K)``), which read
+    as °C looks like an overheating drive. Explicit Celsius wins, then Kelvin,
+    then Fahrenheit; a bare number is taken as Celsius.
     """
     for line in out.splitlines():
         key, sep, value = line.partition(":")
@@ -413,6 +415,9 @@ def _parse_nvme_temp(out: str) -> TempReading:
         m = re.search(r"(-?\d+)\s*K(?:elvin)?\b", value)
         if m:
             return int(m.group(1)) - 273
+        m = re.search(r"(-?\d+)\s*°?\s*F\b", value)
+        if m:
+            return round((int(m.group(1)) - 32) * 5 / 9)
         m = re.search(r"(-?\d+)", value)
         if m:
             return int(m.group(1))
@@ -645,6 +650,19 @@ def release_pwm(pwm_path: Optional[str], *, full_speed: bool = False) -> None:
         logger.info("Set %s = 255 (full speed) on exit", pwm_path)
     except OSError as exc:
         logger.warning("Could not set %s to full speed on exit: %s", pwm_path, exc)
+
+
+def _manual_mode_lost(pwm_path: str, last_pwm: Optional[int]) -> bool:
+    """True when the channel left manual mode behind the daemon's back.
+
+    it87 (seen on the ODROID H4's IT8613E) reports ``pwmN_enable = 0`` ("full
+    speed") for a manual channel whose duty is 255. After our own full-speed
+    write that is not a mode change and must not trigger a re-assert.
+    """
+    mode = _read_int(pwm_path + "_enable")
+    if mode in (None, 1):
+        return False
+    return not (mode == 0 and last_pwm == PWM_FULL)
 
 
 def ensure_manual_pwm_mode(pwm_path: str) -> bool:
@@ -964,7 +982,7 @@ def run_loop_iteration(deps: LoopDeps, state: LoopState, config: FanConfig) -> L
             heartbeat_due
             and path
             and deps.refresh_path is not None
-            and _read_int(path + "_enable") not in (None, 1)
+            and _manual_mode_lost(path, state.last_pwm)
         ):
             ensure_manual_pwm_mode(path)
             state.last_pwm = None

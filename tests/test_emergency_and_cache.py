@@ -98,6 +98,47 @@ def test_real_deps_use_the_full_speed_writer(monkeypatch):
     assert fan_control.LoopDeps.real().write_full_fn is fan_control.write_pwm_full
 
 
+def test_enable_zero_after_own_full_speed_write_is_not_a_mode_change(tmp_path):
+    # it87 / IT8613E reports pwmN_enable = 0 for a manual channel at duty 255
+    # (observed on the ODROID H4 after the exit write).
+    pwm = tmp_path / "pwm2"
+    pwm.write_text("255")
+    enable = tmp_path / "pwm2_enable"
+    enable.write_text("0\n")
+    assert fan_control._manual_mode_lost(str(pwm), 255) is False
+    assert fan_control._manual_mode_lost(str(pwm), 60) is True  # really lost
+    enable.write_text("2\n")
+    assert fan_control._manual_mode_lost(str(pwm), 255) is True  # automatic mode
+    enable.write_text("1\n")
+    assert fan_control._manual_mode_lost(str(pwm), 60) is False
+    assert fan_control._manual_mode_lost(str(tmp_path / "nope"), 60) is False
+
+
+def test_heartbeat_does_not_reassert_during_full_speed(make_config, tmp_path):
+    pwm = tmp_path / "pwm2"
+    pwm.write_text("0")
+    enable = tmp_path / "pwm2_enable"
+    enable.write_text("1\n")
+    writes = []
+    clock = {"t": 0.0}
+
+    def writer(v, c, p):
+        writes.append(v)
+        if v == 255:
+            enable.write_text("0\n")  # what the chip then reports
+        return True
+
+    deps = _deps([None, None, None], writer, pwm_path=str(pwm), refresh_path=lambda: str(pwm))
+    deps.clock = lambda: clock["t"]
+    cfg = make_config(**SERVICE_LIKE)
+    state = fan_control.LoopState()
+    for _ in range(3):  # fail-safe across two heartbeats
+        state = fan_control.run_loop_iteration(deps, state, cfg)
+        clock["t"] += fan_control.LOG_REPORT_INTERVAL + 1
+    assert writes == [255]  # no forced rewrites
+    assert enable.read_text() == "0\n"  # and no enable writes
+
+
 # ----------------------------------------------------------------------- cache
 
 

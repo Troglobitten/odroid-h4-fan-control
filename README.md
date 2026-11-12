@@ -41,180 +41,187 @@ overheat shutdown, and bounded journal logging.
   of spawning a process per device every cycle; sleeping disks are not woken up.
 - Auto-detects the PWM sysfs node (prefers `it8613`/`it87`); keeps probing if it is
   not there yet (driver loaded later) and re-resolves if it vanishes.
-- **Import-safe & testable:** no side effects at import time; **157** pytest cases, all
+- **Import-safe & testable:** no side effects at import time; **166** pytest cases, all
   hardware I/O mocked; CI runs on every push.
 
 ---
 
 ## Requirements
 
-- **ODROID H4** with the fan set to **software mode** in the BIOS.
-- **Python 3.8+** (`python3`).
-- **root** for writing `/sys/class/hwmon` (the systemd unit runs as root; manual runs
-  need `sudo`).
-- Optional kernel module **it87** if your board needs it (see step 1).
-- Optional **nvme-cli** for NVMe temperatures via NVMe SMART.
-- Optional **smartmontools** (`smartctl`) for SATA drive temperatures.
-
-> **Note:** Some ODROID H4 boards use the Hardkernel EC instead of `it87`. The script
-> auto-detects the PWM node and its `*_enable` file; if your board exposes different
-> sysfs paths, see [Troubleshooting](#troubleshooting).
+- **ODROID H4** (tested: IT8613E fan controller, Debian 13, kernel 6.12).
+- BIOS option **Smart Fan Mode** set to **Software** — see step 1.
+- The out-of-tree **it87** kernel driver, installed via DKMS — see step 3.
+- **Python 3.8+** (`python3`), **systemd**, and **root** (the service runs as root;
+  manual runs need `sudo`).
+- Optional **nvme-cli** for NVMe temperatures and **smartmontools** (`smartctl`) for
+  SATA drive temperatures. Both are installed in step 2.
 
 ---
 
 ## Installation
 
-### Step 1 — Optional: hardware support tools
+Verified end to end on an ODROID H4 with Debian 13. Every block can be pasted as is.
 
-Only needed if you want NVMe / drive temperatures, or if your board requires the `it87`
-module:
+### Step 1 — BIOS: switch fan control to software mode
+
+Reboot into the BIOS and set
+
+**Advanced → Hardware Monitor → Smart Fan Function → Fan Setting → Smart Fan Mode**
+to **Software**,
+
+then save and boot back into Linux.
+
+This is not optional: as long as the BIOS controls the fan, the `it87` driver still
+finds the chip (`it87: Found IT8613E chip` in `dmesg`) but creates **no** hwmon device,
+so there is no PWM node to write to.
+
+### Step 2 — Install packages
 
 ```bash
-# NVMe + SATA drive temperatures
 sudo apt update
-sudo apt install nvme-cli smartmontools
+sudo apt install -y git dkms build-essential linux-headers-amd64 linux-headers-$(uname -r) nvme-cli smartmontools
+```
 
-# it87 kernel module (only if no hwmon PWM node is present out of the box).
-# DKMS install is preferred: the module is rebuilt automatically on every
-# kernel update, so fan control survives reboots and upgrades.
-sudo apt install dkms build-essential git linux-headers-$(uname -r)
-git clone https://github.com/frankcrawford/it87.git
-cd it87
-sudo ./dkms-install.sh
-sudo modprobe it87
+`linux-headers-amd64` keeps the kernel headers in step with kernel updates. Without it
+DKMS cannot rebuild the driver for a new kernel and the PWM node disappears after the
+next kernel update.
 
-# Auto-load at boot (modprobe alone only lasts until the next reboot).
-# Without DKMS use `make && sudo make install` instead — but then re-run it
-# after every kernel update before modprobe will work again.
+### Step 3 — Install the it87 driver
+
+```bash
+sudo git clone https://github.com/frankcrawford/it87.git /usr/local/src/it87
+cd /usr/local/src/it87 && sudo ./dkms-install.sh
 echo it87 | sudo tee /etc/modules-load.d/it87.conf
 ```
 
-### Step 2 — Clone the repository to the service directory
+`dkms-install.sh` builds the module, installs it and loads it right away; DKMS rebuilds
+it automatically on kernel updates. The last line loads it on every boot.
 
-The systemd unit in step 4 expects the script at `/opt/odroid-fan/fan_control.py`, so
-clone there:
+> With **Secure Boot** enabled the DKMS-signed module is rejected until you enroll the
+> DKMS key (`sudo mokutil --import /var/lib/dkms/mok.pub`, then reboot and confirm).
+> This setup was tested with Secure Boot disabled.
+
+Check that the fan controller is there:
 
 ```bash
-sudo mkdir -p /opt/odroid-fan
-sudo git clone https://github.com/reserve85/odroid-h4-fan-control.git /opt/odroid-fan
-sudo chmod +x /opt/odroid-fan/fan_control.py
+grep -H . /sys/class/hwmon/hwmon*/name; ls /sys/class/hwmon/hwmon*/pwm[0-9]
 ```
 
-> Prefer a different location (e.g. your home directory)? Clone anywhere you like and
-> adjust `WorkingDirectory=` and `ExecStart=` in the systemd unit from step 4 to match.
+Expected (the `hwmonN` number varies between boots — the script finds it itself):
 
-### Step 3 — Verify the script manually (before installing the service)
+```text
+/sys/class/hwmon/hwmon2/name:it8613
+/sys/class/hwmon/hwmon2/pwm2
+```
+
+`No such file or directory` for the `pwm` part means the BIOS is still in automatic
+mode (step 1). On the H4 the fan header is `pwm2`; the IT8613E has no `pwm1`.
+
+### Step 4 — Get the script
 
 ```bash
-# 1. Show all options (works without root)
-python3 /opt/odroid-fan/fan_control.py --help
+sudo git clone https://github.com/reserve85/odroid-h4-fan-control.git /opt/odroid-fan
+```
 
-# 2. Short test run with EXACTLY the flags the service will use (Ctrl+C stops it).
-#    Include -o here: overheat shutdown is only active with -o, so a test run
-#    without it cannot reveal a sensor that would power the board off.
+> Prefer a different location? Clone anywhere you like and adjust `WorkingDirectory=`
+> and `ExecStart=` in the unit file from step 6 to match.
+
+### Step 5 — Test run (before installing the service)
+
+Run the script with exactly the flags the service uses, **including `-o`**: the
+overheat shutdown is only active with `-o`, so a test without it cannot reveal a sensor
+reading that would power the board off.
+
+```bash
 sudo python3 /opt/odroid-fan/fan_control.py -v -o -c lin --tmin 40 --tmax 80 --pwm-min 30 --pwm-max 128 --overheat-threshold 95 --pwm-hysteresis 2
 ```
 
-A healthy run looks like this:
+A healthy run on the H4 looks like this:
 
 ```text
-Using PWM sysfs path: /sys/class/hwmon/hwmon2/pwm1
-Set /sys/class/hwmon/hwmon2/pwm1_enable = 1 (manual mode; was 2)
-fan_control.py started (sleep=2s, curve=lin, overheat=False, ...)
-CPU: 44°C  Drive: N/A  NVMe: 38°C  PWM: 74
+Using PWM sysfs path: /sys/class/hwmon/hwmon2/pwm2
+fan_control.py started (sleep=2s, curve=lin, overheat=True, overheat_threshold=95, ...)
+Wrote PWM 39 to /sys/class/hwmon/hwmon2/pwm2
+CPU: 44°C  Drive: N/A  NVMe: 34°C  PWM: 39
+Wrote PWM 30 to /sys/class/hwmon/hwmon2/pwm2
+CPU: 33°C  Drive: N/A  NVMe: 34°C  PWM: 30
 ```
 
 What to check:
 
 | Line | Meaning |
 |---|---|
-| `Using PWM sysfs path: ...` | A fan controller node was found. |
-| `Set ..._enable = 1 (manual mode; ...)` | The script switched the channel to manual control. |
-| `No PWM sysfs path found` | No PWM node detected — see [Troubleshooting](#troubleshooting). |
-| `CPU: ... PWM: ...` | A status line; PWM should rise when the CPU heats up. |
+| `Using PWM sysfs path: ...` | The fan controller node was found. |
+| `No PWM sysfs path found yet` | No PWM node — go back to steps 1 and 3. |
+| `CPU: ... NVMe: ... PWM: ...` | A status line. The temperatures must be plausible; PWM rises when the CPU heats up. |
 | `Ignoring implausible temperature ...` | A sensor returns garbage; it is ignored. Note which one. |
 | `Overheat reading 1/3 ...` | A reading hit the threshold — **do not install the service** until you know why. |
 
-If everything looks right, press `Ctrl+C` and continue.
+Press `Ctrl+C` to stop. The script then prints
 
-### Step 4 — Install the systemd service
-
-Create `/etc/systemd/system/fancontrol.service`:
-
-```ini
-[Unit]
-Description=ODROID H4 Fan Control Python Service
-# Start after /etc/modules-load.d (it87) has been processed. If the hwmon node
-# is still missing, the script keeps probing for it every cycle.
-After=systemd-modules-load.service local-fs.target
-Wants=systemd-modules-load.service
-# Stop restarting after 5 failures in 60 s instead of looping forever.
-StartLimitIntervalSec=60
-StartLimitBurst=5
-
-[Service]
-Type=simple
-WorkingDirectory=/opt/odroid-fan
-ExecStart=/usr/bin/python3 /opt/odroid-fan/fan_control.py -v -o -c lin --tmin 40 --tmax 80 --pwm-min 30 --pwm-max 128 --overheat-threshold 95 --pwm-hysteresis 2
-Restart=always
-RestartSec=5
-# Fan control must write to /sys/class/hwmon, which requires root.
-# Additional hardening below restricts everything else.
-User=root
-ProtectSystem=strict
-ReadWritePaths=/sys/class/hwmon
-PrivateTmp=yes
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=fancontrol
-
-[Install]
-WantedBy=multi-user.target
+```text
+fan_control.py interrupted (Ctrl+C / SIGTERM); stopping
+Set /sys/class/hwmon/hwmon2/pwm2 = 255 (full speed) on exit
 ```
 
-> If you cloned the repository somewhere other than `/opt/odroid-fan`, update
-> `WorkingDirectory=` and `ExecStart=` accordingly.
+and the fan runs at full speed until the service takes over in the next step. That is
+intended: a stopped controller must never leave the fan at a low speed.
 
-Then enable and start it:
+### Step 6 — Install and start the service
+
+The unit file ships with the repository ([fancontrol.service](fancontrol.service)):
 
 ```bash
+sudo cp /opt/odroid-fan/fancontrol.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable fancontrol.service
-sudo systemctl start fancontrol.service
+sudo systemctl enable --now fancontrol.service
 ```
 
-### Step 5 — Verify the service
+To change the fan curve, edit the `ExecStart=` line in
+`/etc/systemd/system/fancontrol.service` (see [Command Line Options](#command-line-options)),
+then run `sudo systemctl daemon-reload && sudo systemctl restart fancontrol.service`.
+Remove `-v` there if you do not want a `Wrote PWM ...` line for every change.
+
+### Step 7 — Verify
 
 ```bash
-# status should be "active (running)"
-systemctl status fancontrol.service
-
-# follow the logs
-sudo journalctl -u fancontrol.service -f -o short-iso-precise
-
-# watch the PWM value respond to load (in another shell)
-watch -n1 'grep . /sys/class/hwmon/hwmon*/pwm[0-9]'
+systemctl status fancontrol.service --no-pager | head -5
+sudo journalctl -u fancontrol.service -b --no-pager | tail -5
+grep -H . /sys/class/hwmon/hwmon*/pwm2 /sys/class/hwmon/hwmon*/fan2_input
 ```
 
-To force the fan up, put some load on the board, e.g.:
+The service must be `active (running)` and `enabled`, the journal must show status
+lines without warnings, and the last command shows the current PWM value and fan speed.
+
+Put some load on the CPU and watch the fan follow (no extra packages needed):
 
 ```bash
-sudo apt install stress-ng
-stress-ng --cpu 4 --timeout 60
+for i in 1 2 3 4; do timeout 30 sh -c 'while :; do :; done' & done
+watch -n2 'grep -H . /sys/class/hwmon/hwmon*/pwm2 /sys/class/hwmon/hwmon*/fan2_input'
 ```
 
-The value of the PWM node named in the `Using PWM sysfs path: ...` log line should
-climb while the load runs and fall back afterwards.
+Reference values from the test board with the flags above:
+
+| State | CPU | PWM | Fan |
+|---|---|---|---|
+| Idle | 35 °C | 30 | ~550 rpm |
+| 4 threads loaded | 54–57 °C | 64–71 | 1100–1230 rpm |
+| Service stopped | — | 255 | ~3200 rpm |
+
+Finally reboot once (`sudo reboot`) and repeat the three commands at the top of this
+step: the service must come up by itself.
 
 ### Updating
 
 ```bash
-sudo systemctl stop fancontrol.service
 sudo git -C /opt/odroid-fan pull
-sudo systemctl start fancontrol.service
+sudo systemctl restart fancontrol.service
 ```
 
-(Run `sudo systemctl daemon-reload` first if the unit file changed.)
+If `git pull` lists `fancontrol.service` among the changed files, copy it again before
+the restart
+(`sudo cp /opt/odroid-fan/fancontrol.service /etc/systemd/system/ && sudo systemctl daemon-reload`).
+This overwrites your own `ExecStart=` changes.
 
 ### Uninstalling
 
@@ -224,6 +231,44 @@ sudo rm /etc/systemd/system/fancontrol.service
 sudo systemctl daemon-reload
 sudo rm -rf /opt/odroid-fan
 ```
+
+The fan then runs at full speed until the next reboot; switch the BIOS back to
+automatic fan control if you no longer want software control. To remove the driver as
+well:
+
+```bash
+sudo rm /etc/modules-load.d/it87.conf
+cd /usr/local/src/it87 && sudo ./dkms-remove.sh
+```
+
+---
+
+## Fan curve
+
+The shipped [fancontrol.service](fancontrol.service) uses a linear curve between 40 °C
+and 80 °C, driven by the hottest of the CPU, NVMe and drive temperatures:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/fan-curve-dark.svg">
+  <img src="docs/fan-curve-light.svg" width="720"
+       alt="Fan curve: PWM 30 up to 40 °C, rising linearly to PWM 128 at 80 °C, PWM 255 from 95 °C">
+</picture>
+
+| Hottest temperature | PWM | Note |
+|---|---|---|
+| up to 40 °C | 30 | `--pwm-min` (about 550 rpm on the test board) |
+| 50 °C | 54 | |
+| 60 °C | 79 | |
+| 70 °C | 103 | |
+| 80 °C to 94 °C | 128 | `--pwm-max` |
+| 95 °C and above | 255 | overheat (`-o`): full speed, shutdown after 3 readings in a row |
+
+PWM 255 is also used when no sensor delivers a reading (fail-safe) and after the
+service stops. Run without any flags, the script itself defaults to a linear curve from
+PWM 20 at 30 °C to PWM 255 at 80 °C, without overheat shutdown.
+
+The picture is generated from the unit file and the real curve code; after changing
+the flags in `fancontrol.service`, refresh it with `python3 docs/make_fan_curve.py`.
 
 ---
 
@@ -316,7 +361,7 @@ is mocked**, so it runs anywhere (Linux, Windows, CI).
 # install the package in editable mode with dev tools (pytest + ruff)
 python3 -m pip install -e ".[dev]"
 
-# run the suite (157 tests, ~0.2 s; a 30 s faulthandler guard fails hangs fast)
+# run the suite (166 tests, ~0.2 s; a 30 s faulthandler guard fails hangs fast)
 python3 -m pytest
 
 # lint
@@ -350,9 +395,12 @@ last -x | head
 ```
 
 `Overheat threshold reached: shutting down (...)` names every sensor value at that
-moment. Current versions ignore readings outside −40…150 °C and need
+moment. The known cause on the ODROID H4: `nvme smart-log` (nvme-cli 2.x) prints the
+temperature in **Fahrenheit** under US locales (`105 °F (314 K)`), and older versions
+of this script read that number as °C — e.g. `temp=118` for a 48 °C drive. The unit
+is now parsed explicitly. Current versions also ignore readings outside −40…150 °C and need
 `--overheat-confirm` (default 3) consecutive hits, so a single glitch no longer powers
-the board off. Update (`git pull`), re-run step 3 **with `-o`**, then re-enable the
+the board off. Update (`git pull`), re-run step 5 **with `-o`**, then re-enable the
 service. If the log shows no fancontrol lines at all before the hang, it is a kernel
 problem (usually `it87` with `force_id`): check `journalctl -b -1 -k -p err`.
 
@@ -363,17 +411,21 @@ List what the system exposes:
 for h in /sys/class/hwmon/hwmon*; do echo -n "$h: "; cat $h/name 2>/dev/null || echo "(no name)"; ls $h | grep -E '^pwm|^fan' 2>/dev/null || true; done
 ```
 
-- No `pwm*` entries at all → install/load the `it87` module (step 1), or check that
-  the BIOS fan is set to **software mode**.
+- No `it8613` entry and no `pwm*` at all, but `sudo dmesg | grep it87` shows
+  `Found IT8613E chip` → the BIOS still controls the fan. Set **Smart Fan Mode** to **Software**
+  (step 1) and reboot.
+- `dmesg` shows nothing about `it87` → the driver is not loaded: install it (step 3)
+  or load it with `sudo modprobe it87`.
 - Worked before, but no `pwm*` after a reboot or kernel update → `modprobe it87` only
-  lasts until reboot unless `/etc/modules-load.d/it87.conf` exists, and a plain
-  `make install` module must be rebuilt for each new kernel (the DKMS install in
-  step 1 handles both automatically). If `modprobe it87` fails with `No such device`,
-  the in-tree driver could not claim the chip — install the DKMS module from step 1,
-  or force detection with `sudo modprobe it87 force_id=0x<ID>` using the chip ID
-  reported by `sudo sensors-detect`. The service does not need a restart
-  afterwards: while no PWM node is known it probes for one every cycle and logs
-  `Using PWM sysfs path: ...` once it appears.
+  lasts until reboot unless `/etc/modules-load.d/it87.conf` exists, and DKMS can only
+  rebuild the module for a new kernel if the matching headers are installed
+  (`linux-headers-amd64` from step 2 takes care of that; check with
+  `sudo dkms status`). If `modprobe it87` fails with `No such device`, the in-tree
+  driver could not claim the chip — install the DKMS module from step 3, or force
+  detection with `sudo modprobe it87 force_id=0x<ID>` using the chip ID reported by
+  `sudo sensors-detect`. The service does not need a restart afterwards: while no PWM
+  node is known it probes for one every cycle and logs `Using PWM sysfs path: ...`
+  once it appears.
 - Entries exist but the wrong chip is picked → adjust the `preferred_names` tuple in
   `find_pwm_path()` (`fan_control.py`).
 
@@ -381,16 +433,17 @@ for h in /sys/class/hwmon/hwmon*; do echo -n "$h: "; cat $h/name 2>/dev/null || 
 likely still under automatic/thermal control. The script forces manual mode at startup:
 
 ```text
-Set /sys/class/hwmon/hwmon2/pwm1_enable = 1 (manual mode; was 2)
+Set /sys/class/hwmon/hwmon2/pwm2_enable = 1 (manual mode; was 2)
 ```
 
-If you instead see `Could not set ... to manual mode`, set it manually to see why:
+If you instead see `Could not set ... to manual mode`, set it manually to see why
+(on the H4 the fan is `pwm2`):
 
 ```bash
-echo 1 | sudo tee /sys/class/hwmon/hwmon*/pwm1_enable
+echo 1 | sudo tee /sys/class/hwmon/hwmon*/pwm2_enable
 ```
 
-Also verify the BIOS fan setting is **software mode**.
+Also verify the BIOS option **Smart Fan Mode** is set to **Software** (step 1).
 
 **CPU temperature looks too low / like chassis air** — you are probably on an ACPI
 thermal zone instead of `coretemp`. Ensure the `coretemp` driver is loaded

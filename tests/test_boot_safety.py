@@ -104,6 +104,18 @@ def test_smartctl_no_temperature():
         ("temperature : 311 K\n", 38),
         ("Warning Temperature Time : 99\ntemperature : 40 C\n", 40),
         ("Temperature Sensor 1 : 120 C\n", None),
+        # nvme-cli 2.13 under LANG=en_US.UTF-8, verbatim from the ODROID H4.
+        # Read as °C this was 105/118 "degrees" -> instant overheat shutdown.
+        (
+            (
+                "critical_warning\t\t\t: 0\n"
+                "temperature\t\t\t\t: 105 °F (314 K)\n"
+                "Temperature Sensor 1\t\t\t: 105 °F (314 K)\n"
+            ),
+            41,
+        ),
+        ("temperature : 118 °F\n", 48),  # Fahrenheit only, no Kelvin
+        ("temperature : 104 F\n", 40),
     ],
 )
 def test_nvme_parse(out, expected):
